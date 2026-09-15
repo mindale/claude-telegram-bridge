@@ -1,0 +1,18 @@
+[Unit]
+Description=Claude Code <-> Telegram bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Замените на реального пользователя и путь, если не root
+User=root
+WorkingDirectory=/opt/claude-telegram-bridge
+EnvironmentFile=/opt/claude-telegram-bridge/.env
+ExecStart=/usr/bin/python3 /opt/claude-telegram-bridge/bot.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+
