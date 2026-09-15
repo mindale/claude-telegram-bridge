@@ -1,0 +1,5 @@
+aiogram>=3.4,<4
+python-dotenv>=1.0
+faster-whisper>=1.0
+telegramify-markdown>=0.3
+
