@@ -196,9 +196,18 @@ def new_thread() -> dict:
     }
 
 
-def get_active_thread(chat_id: int) -> tuple[dict, str, dict]:
-    """Возвращает (state, thread_name, thread_dict) для активной ветки чата."""
-    state = load_state()
+def get_active_thread(chat_id: int, state: dict | None = None) -> tuple[dict, str, dict]:
+    """Возвращает (state, thread_name, thread_dict) для активной ветки чата.
+
+    Если state не передан — загружает его сам заново (годится для чтения:
+    /status, on_text, on_voice и т.п.). ВАЖНО: если вызывающий код после
+    этого собирается изменить thread и вызвать save_state(...), он обязан
+    сам сделать state = load_state() и передать этот же объект сюда —
+    иначе thread будет частью отдельно загруженного, невидимого снаружи
+    состояния, правка потеряется, а save_state запишет на диск старые
+    данные без изменения (этим был сломан /voicemode и ряд других команд)."""
+    if state is None:
+        state = load_state()
     chat_state = get_chat_state(state, chat_id)
     name = chat_state["active"]
     if name not in chat_state["threads"]:
@@ -672,7 +681,7 @@ async def cmd_reset(message: Message):
     if not check_access(message):
         return
     state = load_state()
-    _, name, thread = get_active_thread(message.chat.id)
+    _, name, thread = get_active_thread(message.chat.id, state)
     thread["session_id"] = None
     save_state(state)
     await message.answer(f"История ветки «{name}» сброшена. Начинаем разговор с чистого листа.")
@@ -686,7 +695,7 @@ async def cmd_style(message: Message, command: CommandObject):
         return
     text = (command.args or "").strip()
     state = load_state()
-    _, name, thread = get_active_thread(message.chat.id)
+    _, name, thread = get_active_thread(message.chat.id, state)
     if not text:
         await message.answer(
             "Использование: /style <описание стиля>, например:\n"
@@ -703,7 +712,7 @@ async def cmd_resetstyle(message: Message):
     if not check_access(message):
         return
     state = load_state()
-    _, name, thread = get_active_thread(message.chat.id)
+    _, name, thread = get_active_thread(message.chat.id, state)
     thread["persona"] = None
     save_state(state)
     await message.answer(f"Стиль ветки «{name}» сброшен на стандартный.")
@@ -738,7 +747,7 @@ async def cmd_addskill(message: Message, command: CommandObject):
         await message.answer(f"Нет скилла «{name}». Список — /skills")
         return
     state = load_state()
-    _, thread_name, thread = get_active_thread(message.chat.id)
+    _, thread_name, thread = get_active_thread(message.chat.id, state)
     if name not in thread["skills"]:
         thread["skills"].append(name)
         save_state(state)
@@ -751,7 +760,7 @@ async def cmd_removeskill(message: Message, command: CommandObject):
         return
     name = (command.args or "").strip()
     state = load_state()
-    _, thread_name, thread = get_active_thread(message.chat.id)
+    _, thread_name, thread = get_active_thread(message.chat.id, state)
     if name in thread["skills"]:
         thread["skills"].remove(name)
         save_state(state)
@@ -768,7 +777,7 @@ async def cmd_voice(message: Message, command: CommandObject):
         return
     arg = (command.args or "").strip().lower()
     state = load_state()
-    _, thread_name, thread = get_active_thread(message.chat.id)
+    _, thread_name, thread = get_active_thread(message.chat.id, state)
     current = thread.get("tts_speaker")
 
     if not arg:
@@ -805,7 +814,7 @@ async def cmd_voicemode(message: Message, command: CommandObject):
         return
     arg = (command.args or "").strip().lower()
     state = load_state()
-    _, thread_name, thread = get_active_thread(message.chat.id)
+    _, thread_name, thread = get_active_thread(message.chat.id, state)
     current = thread.get("voice_mode", "assistant")
 
     if arg in ("transcribe", "on", "off", "только", "расшифровка"):
