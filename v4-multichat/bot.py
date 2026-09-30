@@ -106,7 +106,7 @@ TTS_ENABLED = os.environ.get("TTS_ENABLED", "true").strip().lower() in ("1", "tr
 # Голоса модели v4_ru. Дефолтный — из .env, конкретная ветка может выбрать
 # свой через /voice <имя>.
 TTS_SPEAKERS = ["aidar", "baya", "kseniya", "xenia", "eugene", "random"]
-TTS_SPEAKER = os.environ.get("TTS_SPEAKER", "xenia")
+TTS_SPEAKER = os.environ.get("TTS_SPEAKER", "aidar")
 TTS_SAMPLE_RATE = int(os.environ.get("TTS_SAMPLE_RATE", "48000"))  # 8000 / 24000 / 48000
 TTS_DEVICE = os.environ.get("TTS_DEVICE", "cpu")
 # Сколько символов ответа озвучивать за один раз. У Silero есть внутренний
