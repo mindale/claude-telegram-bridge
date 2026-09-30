@@ -495,16 +495,22 @@ def check_access(message: Message) -> bool:
 
 
 class TypingIndicator:
-    """Держит статус "печатает..." живым, пока Claude думает."""
+    """Держит статус-индикатор Telegram живым, пока Claude думает.
 
-    def __init__(self, chat_id: int):
+    По умолчанию — "печатает...". Для голосового диалога (когда ответ
+    придёт голосовым сообщением) передайте action=ChatAction.RECORD_VOICE —
+    пользователь увидит "записывает голосовое...", что честнее отражает,
+    что сейчас происходит."""
+
+    def __init__(self, chat_id: int, action: ChatAction = ChatAction.TYPING):
         self.chat_id = chat_id
+        self.action = action
         self._task: asyncio.Task | None = None
 
     async def _loop(self):
         try:
             while True:
-                await bot.send_chat_action(self.chat_id, ChatAction.TYPING)
+                await bot.send_chat_action(self.chat_id, self.action)
                 await asyncio.sleep(TYPING_REFRESH_SECONDS)
         except asyncio.CancelledError:
             pass
@@ -861,8 +867,14 @@ async def on_voice(message: Message):
     ogg_path: Path | None = None
     wav_path: Path | None = None
     try:
-        async with TypingIndicator(message.chat.id):
-            _, thread_name, thread = get_active_thread(message.chat.id)
+        # Узнаём режим ветки заранее, чтобы выбрать правильный статус:
+        # если ответ придёт голосом — "записывает голосовое...", иначе,
+        # как обычно, "печатает...".
+        _, thread_name, thread = get_active_thread(message.chat.id)
+        will_reply_with_voice = TTS_ENABLED and thread.get("voice_mode", "assistant") == "assistant"
+        indicator_action = ChatAction.RECORD_VOICE if will_reply_with_voice else ChatAction.TYPING
+
+        async with TypingIndicator(message.chat.id, action=indicator_action):
             cwd = thread_dir(message.chat.id, thread_name)
             ogg_path = cwd / f"voice_{uuid.uuid4().hex}.ogg"
             wav_path = ogg_path.with_suffix(".wav")
