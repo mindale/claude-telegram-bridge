@@ -21,6 +21,11 @@ echo "==> Claude Code: $(claude --version)"
 echo "==> Установка Python, pip, ffmpeg (нужны для моста с Telegram)"
 dnf -y install python3 python3-pip ffmpeg
 
+echo "==> Установка PyTorch (CPU-версия, для озвучки ответов через Silero TTS)"
+# Обычный `pip install torch` тянет CUDA-сборку (гигабайты, не нужны без
+# GPU) — берём отдельно с официального CPU-индекса PyTorch.
+python3 -m pip install --break-system-packages torch --index-url https://download.pytorch.org/whl/cpu
+
 echo
 echo "Готово. Дальше:"
 echo "1) На своём компьютере (с браузером) выполните: claude setup-token"

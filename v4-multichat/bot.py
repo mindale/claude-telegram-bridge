@@ -6,6 +6,10 @@
 Поддерживает: текст, голосовые сообщения (транскрибируются локально через
 faster-whisper), фото (передаются Claude Code как файл в рабочей директории).
 
+Голос — двусторонне и зеркально: если вы прислали голосовое, ответ Claude
+озвучивается голосом (локально, через Silero TTS) и отправляется обратно как
+голосовое сообщение; на обычный текст ответ приходит текстом, как раньше.
+
 Внутри одного Telegram-чата можно вести НЕСКОЛЬКО независимых веток
 разговора ("чатов") — у каждой своя история и свой стиль/скиллы:
 
@@ -40,7 +44,7 @@ import uuid
 from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message
+from aiogram.types import Message, FSInputFile
 from aiogram.filters import Command, CommandObject
 from aiogram.enums import ChatAction, ParseMode
 from dotenv import load_dotenv
@@ -66,6 +70,8 @@ STATE_FILE = BASE_DIR / "_state.json"
 SKILLS_FILE = Path(os.environ.get("SKILLS_FILE", "./skills.json")).resolve()
 
 CLAUDE_TIMEOUT = int(os.environ.get("CLAUDE_TIMEOUT_SECONDS", "300"))
+FFMPEG_TIMEOUT = int(os.environ.get("FFMPEG_TIMEOUT_SECONDS", "60"))
+VOICE_DOWNLOAD_TIMEOUT = int(os.environ.get("VOICE_DOWNLOAD_TIMEOUT_SECONDS", "60"))
 
 DEFAULT_PERSONA = (
     "Ты общаешься со мной в Telegram, как close friend, а не как ассистент "
@@ -88,6 +94,20 @@ DEFAULT_THREAD = "general"
 
 WHISPER_MODEL_SIZE = os.environ.get("WHISPER_MODEL_SIZE", "small")
 WHISPER_LANGUAGE = os.environ.get("WHISPER_LANGUAGE", "ru")
+
+# ---------- TTS (озвучка ответов через Silero) ----------
+TTS_ENABLED = os.environ.get("TTS_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
+# Голоса модели v4_ru: aidar, baya, kseniya, xenia, eugene, random
+TTS_SPEAKER = os.environ.get("TTS_SPEAKER", "xenia")
+TTS_SAMPLE_RATE = int(os.environ.get("TTS_SAMPLE_RATE", "48000"))  # 8000 / 24000 / 48000
+TTS_DEVICE = os.environ.get("TTS_DEVICE", "cpu")
+# Сколько символов ответа озвучивать за один раз. У Silero есть внутренний
+# лимит на длину строки за один вызов (около 1000 символов) — режем текст на
+# куски по границам предложений и склеиваем звук, но всё вместе не длиннее
+# TTS_MAX_CHARS, иначе голосовое получится неприлично длинным.
+TTS_CHUNK_CHARS = 700
+TTS_MAX_CHARS = int(os.environ.get("TTS_MAX_CHARS", "4000"))
+TTS_TIMEOUT = int(os.environ.get("TTS_TIMEOUT_SECONDS", "120"))
 
 TELEGRAM_MAX_LEN = 4000
 
@@ -201,6 +221,133 @@ def transcribe(audio_path: Path) -> str:
     model = get_whisper_model()
     segments, _info = model.transcribe(str(audio_path), language=WHISPER_LANGUAGE)
     return " ".join(seg.text.strip() for seg in segments).strip()
+
+
+# ---------- Ленивая загрузка Silero TTS (только при первой озвучке) ----------
+_tts_model = None
+
+
+def get_tts_model():
+    """Загружает модель Silero TTS (v4_ru) через torch.hub. Модель кешируется
+    на диске (~/.cache/torch/hub) после первой загрузки — в дальнейшем
+    интернет для неё не нужен, только при самом первом запуске."""
+    global _tts_model
+    if _tts_model is None:
+        import torch
+        log.info("Загружаю модель Silero TTS (v4_ru)...")
+        torch.set_num_threads(max(1, os.cpu_count() or 1))
+        model, _ = torch.hub.load(
+            repo_or_dir="snakers4/silero-models",
+            model="silero_tts",
+            language="ru",
+            speaker="v4_ru",
+            trust_repo=True,
+        )
+        model.to(TTS_DEVICE)
+        _tts_model = model
+    return _tts_model
+
+
+def split_text_for_tts(text: str, max_len: int) -> list[str]:
+    """Режет текст на куски по границам предложений так, чтобы каждый кусок
+    укладывался в лимит длины одного вызова Silero (иначе модель бросает
+    ValueError на длинных строках)."""
+    import re
+
+    sentences = re.split(r"(?<=[.!?…])\s+", text.strip())
+    chunks: list[str] = []
+    current = ""
+    for sentence in sentences:
+        if not sentence:
+            continue
+        candidate = f"{current} {sentence}".strip() if current else sentence
+        if len(candidate) <= max_len:
+            current = candidate
+        else:
+            if current:
+                chunks.append(current)
+            if len(sentence) <= max_len:
+                current = sentence
+            else:
+                # Одно предложение само по себе длиннее лимита — режем жёстко.
+                for i in range(0, len(sentence), max_len):
+                    chunks.append(sentence[i : i + max_len])
+                current = ""
+    if current:
+        chunks.append(current)
+    return chunks or [text[:max_len]]
+
+
+def synthesize_speech(text: str, wav_path: Path) -> None:
+    """Синхронно синтезирует речь и пишет .wav. Вызывать только через
+    asyncio.to_thread — сама модель синхронная и не должна выполняться
+    прямо в event loop."""
+    import torch
+    import soundfile as sf
+
+    model = get_tts_model()
+    chunks = split_text_for_tts(text, TTS_CHUNK_CHARS)
+    parts = [
+        model.apply_tts(text=chunk, speaker=TTS_SPEAKER, sample_rate=TTS_SAMPLE_RATE)
+        for chunk in chunks
+    ]
+    audio = torch.cat(parts) if len(parts) > 1 else parts[0]
+    sf.write(str(wav_path), audio.numpy(), TTS_SAMPLE_RATE)
+
+
+def convert_wav_to_voice_ogg(wav_path: Path, ogg_path: Path) -> None:
+    """Синхронно конвертирует .wav в .ogg/Opus — формат, который Telegram
+    принимает для голосовых сообщений (send_voice). Вызывать только через
+    asyncio.to_thread."""
+    subprocess.run(
+        ["ffmpeg", "-y", "-i", str(wav_path), "-c:a", "libopus", "-b:a", "48k", "-vbr", "on", str(ogg_path)],
+        check=True,
+        capture_output=True,
+        timeout=FFMPEG_TIMEOUT,
+    )
+
+
+async def send_reply(message: Message, text: str, cwd: Path, as_voice: bool) -> None:
+    """Отправляет ответ Claude пользователю: текстом (как раньше) или, если
+    as_voice=True и включён TTS, голосовым сообщением. При любой ошибке
+    синтеза/конвертации молча откатывается на текст — пользователь в любом
+    случае получает ответ."""
+    if not (as_voice and TTS_ENABLED):
+        await send_long(message, text)
+        return
+
+    tts_text = text
+    truncated = False
+    if len(tts_text) > TTS_MAX_CHARS:
+        tts_text = tts_text[:TTS_MAX_CHARS]
+        truncated = True
+
+    wav_path: Path | None = None
+    ogg_path: Path | None = None
+    try:
+        wav_path = cwd / f"tts_{uuid.uuid4().hex}.wav"
+        ogg_path = wav_path.with_suffix(".ogg")
+
+        log.info("chat=%s: синтезирую речь (Silero TTS)", message.chat.id)
+        await asyncio.wait_for(
+            asyncio.to_thread(synthesize_speech, tts_text, wav_path), timeout=TTS_TIMEOUT
+        )
+        await asyncio.to_thread(convert_wav_to_voice_ogg, wav_path, ogg_path)
+
+        await message.answer_voice(FSInputFile(ogg_path))
+        if truncated:
+            await message.answer(
+                f"✂️ Ответ длиннее {TTS_MAX_CHARS} символов, озвучено только начало. Текст целиком:"
+            )
+            await send_long(message, text)
+    except Exception:
+        log.exception("chat=%s: не удалось озвучить ответ, отправляю текстом", message.chat.id)
+        await send_long(message, text)
+    finally:
+        if wav_path is not None:
+            wav_path.unlink(missing_ok=True)
+        if ogg_path is not None:
+            ogg_path.unlink(missing_ok=True)
 
 
 # ---------- Вызов Claude Code ----------
@@ -585,37 +732,104 @@ async def on_text(message: Message):
     await send_long(message, reply)
 
 
+def convert_voice_ogg_to_wav(ogg_path: Path, wav_path: Path) -> None:
+    """Синхронно конвертирует входящее голосовое .ogg в .wav для Whisper.
+    Вызывать только через asyncio.to_thread — subprocess.run() блокирующий и
+    не должен выполняться прямо в event loop."""
+    subprocess.run(
+        ["ffmpeg", "-y", "-i", str(ogg_path), "-ar", "16000", "-ac", "1", str(wav_path)],
+        check=True,
+        capture_output=True,
+        timeout=FFMPEG_TIMEOUT,
+    )
+
+
 @dp.message(F.voice)
 async def on_voice(message: Message):
     if not check_access(message):
         return
 
-    async with TypingIndicator(message.chat.id):
-        _, thread_name, _ = get_active_thread(message.chat.id)
-        cwd = thread_dir(message.chat.id, thread_name)
-        ogg_path = cwd / f"voice_{uuid.uuid4().hex}.ogg"
-        wav_path = ogg_path.with_suffix(".wav")
+    ogg_path: Path | None = None
+    wav_path: Path | None = None
+    try:
+        async with TypingIndicator(message.chat.id):
+            _, thread_name, _ = get_active_thread(message.chat.id)
+            cwd = thread_dir(message.chat.id, thread_name)
+            ogg_path = cwd / f"voice_{uuid.uuid4().hex}.ogg"
+            wav_path = ogg_path.with_suffix(".wav")
 
-        file = await bot.get_file(message.voice.file_id)
-        await bot.download_file(file.file_path, destination=ogg_path)
+            log.info("chat=%s: скачиваю голосовое сообщение из Telegram", message.chat.id)
+            try:
+                file = await asyncio.wait_for(
+                    bot.get_file(message.voice.file_id), timeout=VOICE_DOWNLOAD_TIMEOUT
+                )
+                await asyncio.wait_for(
+                    bot.download_file(file.file_path, destination=ogg_path),
+                    timeout=VOICE_DOWNLOAD_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                log.error(
+                    "chat=%s: не удалось скачать голосовое сообщение за %sс (таймаут Telegram API)",
+                    message.chat.id, VOICE_DOWNLOAD_TIMEOUT,
+                )
+                await message.answer(
+                    "⚠️ Не удалось скачать голосовое сообщение из Telegram (таймаут). Попробуйте ещё раз."
+                )
+                return
 
-        subprocess.run(
-            ["ffmpeg", "-y", "-i", str(ogg_path), "-ar", "16000", "-ac", "1", str(wav_path)],
-            check=True,
-            capture_output=True,
-        )
+            log.info("chat=%s: конвертирую входящее ogg -> wav через ffmpeg", message.chat.id)
+            try:
+                # ffmpeg — в отдельном потоке, чтобы не блокировать event loop
+                # (иначе "зависает" не только этот чат, но и все остальные,
+                # и живой индикатор "печатает..." перестаёт обновляться).
+                await asyncio.to_thread(convert_voice_ogg_to_wav, ogg_path, wav_path)
+            except subprocess.TimeoutExpired:
+                log.error("chat=%s: ffmpeg завис и не завершился за %sс", message.chat.id, FFMPEG_TIMEOUT)
+                await message.answer(
+                    "⚠️ Конвертация голосового сообщения зависла (таймаут ffmpeg на сервере)."
+                )
+                return
+            except subprocess.CalledProcessError:
+                log.exception("chat=%s: ffmpeg не смог конвертировать голосовое сообщение", message.chat.id)
+                await message.answer(
+                    "⚠️ Не удалось обработать голосовое сообщение (ошибка ffmpeg на сервере). "
+                    "Попробуйте отправить его ещё раз или напишите текстом."
+                )
+                return
 
-        text = await asyncio.to_thread(transcribe, wav_path)
-        ogg_path.unlink(missing_ok=True)
-        wav_path.unlink(missing_ok=True)
+            log.info("chat=%s: распознаю текст (Whisper)", message.chat.id)
+            try:
+                text = await asyncio.to_thread(transcribe, wav_path)
+            except Exception:
+                log.exception("chat=%s: ошибка распознавания голосового сообщения (whisper)", message.chat.id)
+                await message.answer(
+                    "⚠️ Не удалось распознать голосовое сообщение (ошибка модели распознавания)."
+                )
+                return
+            log.info("chat=%s: распознано: %r", message.chat.id, text[:200])
 
-        if not text:
-            await message.answer("Не удалось распознать голосовое сообщение.")
-            return
+            if not text:
+                await message.answer("Не удалось распознать голосовое сообщение.")
+                return
 
-        await message.answer(f"🎤 Распознано: {text}")
-        reply = await run_claude(message.chat.id, text)
-    await send_long(message, reply)
+            await message.answer(f"🎤 Распознано: {text}")
+            reply = await run_claude(message.chat.id, text)
+        # Голосовой вход -> голосовой ответ (зеркально). Синтез сам по себе
+        # надёжно откатывается на текст при ошибке внутри send_reply.
+        await send_reply(message, reply, cwd, as_voice=True)
+    except Exception:
+        # Раньше любое необработанное исключение (например, сбой скачивания
+        # файла из Telegram) тихо гасилось где-то в диспетчере: пользователь
+        # видел "печатает..." и затем — ничего. Теперь бот всегда отвечает.
+        log.exception("chat=%s: непредвиденная ошибка при обработке голосового сообщения", message.chat.id)
+        await message.answer("⚠️ Произошла ошибка при обработке голосового сообщения. Попробуйте ещё раз.")
+    finally:
+        # Раньше временные файлы удалялись только на успешном пути — при любой
+        # ошибке выше .ogg/.wav оставались в рабочей директории навсегда.
+        if ogg_path is not None:
+            ogg_path.unlink(missing_ok=True)
+        if wav_path is not None:
+            wav_path.unlink(missing_ok=True)
 
 
 @dp.message(F.photo)

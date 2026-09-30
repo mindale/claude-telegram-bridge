@@ -3,3 +3,10 @@ python-dotenv>=1.0
 faster-whisper>=1.0
 telegramify-markdown>=0.3
 
+# --- Озвучка ответов (Silero TTS) ---
+soundfile>=0.12
+omegaconf>=2.3
+# torch НЕ ставится отсюда: обычный `pip install torch` тянет CUDA-версию
+# (гигабайты, не нужны на сервере без GPU). Ставьте CPU-версию отдельно —
+# см. install_fedora.sh или README (Устранение неполадок → TTS).
+
