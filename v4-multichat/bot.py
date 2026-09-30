@@ -25,7 +25,13 @@ faster-whisper), фото (передаются Claude Code как файл в �
     /skills              — список доступных скиллов (из skills.json)
     /addskill <имя>      — подключить скилл к текущей ветке
     /removeskill <имя>   — отключить скилл
-    /status              — показать активную ветку, стиль, скиллы
+    /status              — показать активную ветку, стиль, скиллы, режим голосовых
+
+    /voice [имя]         — показать/сменить голос озвучки для текущей ветки
+                            (aidar, baya, kseniya, xenia, eugene, random)
+    /voicemode [режим]   — assistant (по умолчанию, зеркально) или transcribe
+                            (только расшифровка голосовых, Claude не вызывается);
+                            без аргумента переключает
 
 Запуск:
     python3 bot.py
@@ -97,7 +103,9 @@ WHISPER_LANGUAGE = os.environ.get("WHISPER_LANGUAGE", "ru")
 
 # ---------- TTS (озвучка ответов через Silero) ----------
 TTS_ENABLED = os.environ.get("TTS_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
-# Голоса модели v4_ru: aidar, baya, kseniya, xenia, eugene, random
+# Голоса модели v4_ru. Дефолтный — из .env, конкретная ветка может выбрать
+# свой через /voice <имя>.
+TTS_SPEAKERS = ["aidar", "baya", "kseniya", "xenia", "eugene", "random"]
 TTS_SPEAKER = os.environ.get("TTS_SPEAKER", "xenia")
 TTS_SAMPLE_RATE = int(os.environ.get("TTS_SAMPLE_RATE", "48000"))  # 8000 / 24000 / 48000
 TTS_DEVICE = os.environ.get("TTS_DEVICE", "cpu")
@@ -174,7 +182,18 @@ def get_chat_state(state: dict, chat_id: int) -> dict:
 
 
 def new_thread() -> dict:
-    return {"session_id": None, "persona": None, "skills": []}
+    return {
+        "session_id": None,
+        "persona": None,
+        "skills": [],
+        # "assistant" — голосовое расшифровывается и уходит Claude, ответ
+        # приходит голосом (зеркально). "transcribe" — только расшифровка,
+        # Claude не вызывается (переключается командой /voicemode).
+        "voice_mode": "assistant",
+        # None — использовать глобальный TTS_SPEAKER из .env; иначе — свой
+        # голос для этой ветки (задаётся командой /voice <имя>).
+        "tts_speaker": None,
+    }
 
 
 def get_active_thread(chat_id: int) -> tuple[dict, str, dict]:
@@ -278,7 +297,7 @@ def split_text_for_tts(text: str, max_len: int) -> list[str]:
     return chunks or [text[:max_len]]
 
 
-def synthesize_speech(text: str, wav_path: Path) -> None:
+def synthesize_speech(text: str, wav_path: Path, speaker: str) -> None:
     """Синхронно синтезирует речь и пишет .wav. Вызывать только через
     asyncio.to_thread — сама модель синхронная и не должна выполняться
     прямо в event loop."""
@@ -288,7 +307,7 @@ def synthesize_speech(text: str, wav_path: Path) -> None:
     model = get_tts_model()
     chunks = split_text_for_tts(text, TTS_CHUNK_CHARS)
     parts = [
-        model.apply_tts(text=chunk, speaker=TTS_SPEAKER, sample_rate=TTS_SAMPLE_RATE)
+        model.apply_tts(text=chunk, speaker=speaker, sample_rate=TTS_SAMPLE_RATE)
         for chunk in chunks
     ]
     audio = torch.cat(parts) if len(parts) > 1 else parts[0]
@@ -307,14 +326,18 @@ def convert_wav_to_voice_ogg(wav_path: Path, ogg_path: Path) -> None:
     )
 
 
-async def send_reply(message: Message, text: str, cwd: Path, as_voice: bool) -> None:
+async def send_reply(message: Message, text: str, cwd: Path, as_voice: bool, speaker: str | None = None) -> None:
     """Отправляет ответ Claude пользователю: текстом (как раньше) или, если
-    as_voice=True и включён TTS, голосовым сообщением. При любой ошибке
-    синтеза/конвертации молча откатывается на текст — пользователь в любом
-    случае получает ответ."""
+    as_voice=True и включён TTS, голосовым сообщением. speaker — голос для
+    этого конкретного ответа (обычно из настройки ветки); None — берётся
+    глобальный TTS_SPEAKER из .env. При любой ошибке синтеза/конвертации
+    молча откатывается на текст — пользователь в любом случае получает
+    ответ."""
     if not (as_voice and TTS_ENABLED):
         await send_long(message, text)
         return
+
+    speaker = speaker or TTS_SPEAKER
 
     tts_text = text
     truncated = False
@@ -328,9 +351,9 @@ async def send_reply(message: Message, text: str, cwd: Path, as_voice: bool) -> 
         wav_path = cwd / f"tts_{uuid.uuid4().hex}.wav"
         ogg_path = wav_path.with_suffix(".ogg")
 
-        log.info("chat=%s: синтезирую речь (Silero TTS)", message.chat.id)
+        log.info("chat=%s: синтезирую речь (Silero TTS, голос=%s)", message.chat.id, speaker)
         await asyncio.wait_for(
-            asyncio.to_thread(synthesize_speech, tts_text, wav_path), timeout=TTS_TIMEOUT
+            asyncio.to_thread(synthesize_speech, tts_text, wav_path, speaker), timeout=TTS_TIMEOUT
         )
         await asyncio.to_thread(convert_wav_to_voice_ogg, wav_path, ogg_path)
 
@@ -508,6 +531,8 @@ async def cmd_start(message: Message):
         "Пишите текстом, присылайте голосовые или фото — отвечу через Claude.\n\n"
         "Ветки разговора: /newchat, /chats, /switch, /rename, /delchat\n"
         "Стиль и скиллы: /style, /resetstyle, /skills, /addskill, /removeskill\n"
+        "Голос: /voice — сменить голос озвучки. /voicemode — вкл/выкл ответ Claude "
+        "на голосовые (можно оставить только расшифровку).\n"
         "/reset — сбросить историю текущей ветки. /status — что сейчас активно."
     )
 
@@ -520,11 +545,20 @@ async def cmd_status(message: Message):
     persona = thread.get("persona") or f"(по умолчанию) {CLAUDE_PERSONA}"
     skills = ", ".join(thread.get("skills", [])) or "нет"
     has_history = "есть" if thread.get("session_id") else "нет (начнётся заново)"
+    voice_mode = thread.get("voice_mode", "assistant")
+    voice_mode_label = (
+        "только расшифровка, Claude не вызывается" if voice_mode == "transcribe"
+        else "обычный — расшифровка + ответ Claude голосом"
+    )
+    tts_speaker = thread.get("tts_speaker")
+    voice_label = tts_speaker or f"{TTS_SPEAKER} (по умолчанию)"
     await message.answer(
         f"Активная ветка: {name}\n"
         f"История разговора: {has_history}\n"
         f"Скиллы: {skills}\n"
-        f"Стиль: {persona}"
+        f"Стиль: {persona}\n"
+        f"Режим голосовых: {voice_mode_label}\n"
+        f"Голос TTS: {voice_label}"
     )
 
 
@@ -720,6 +754,81 @@ async def cmd_removeskill(message: Message, command: CommandObject):
         await message.answer(f"Скилл «{name}» и не был подключён к этой ветке.")
 
 
+# ---------- Хендлеры: голос ----------
+
+@dp.message(Command("voice"))
+async def cmd_voice(message: Message, command: CommandObject):
+    if not check_access(message):
+        return
+    arg = (command.args or "").strip().lower()
+    state = load_state()
+    _, thread_name, thread = get_active_thread(message.chat.id)
+    current = thread.get("tts_speaker")
+
+    if not arg:
+        lines = [f"Голос ветки «{thread_name}»: {current or f'{TTS_SPEAKER} (по умолчанию)'}", ""]
+        lines.append("Доступные голоса:")
+        for name in TTS_SPEAKERS:
+            marker = "✅" if name == (current or TTS_SPEAKER) else "▫️"
+            lines.append(f"{marker} {name}")
+        lines.append("")
+        lines.append("Сменить: /voice <имя>. Сбросить на дефолт из .env: /voice default")
+        await message.answer("\n".join(lines))
+        return
+
+    if arg in ("default", "сброс", "reset"):
+        thread["tts_speaker"] = None
+        save_state(state)
+        await message.answer(f"Голос ветки «{thread_name}» сброшен на дефолтный ({TTS_SPEAKER}).")
+        return
+
+    if arg not in TTS_SPEAKERS:
+        await message.answer(
+            f"Неизвестный голос «{arg}». Доступные: {', '.join(TTS_SPEAKERS)}. Список — /voice"
+        )
+        return
+
+    thread["tts_speaker"] = arg
+    save_state(state)
+    await message.answer(f"Голос ветки «{thread_name}» изменён на «{arg}».")
+
+
+@dp.message(Command("voicemode"))
+async def cmd_voicemode(message: Message, command: CommandObject):
+    if not check_access(message):
+        return
+    arg = (command.args or "").strip().lower()
+    state = load_state()
+    _, thread_name, thread = get_active_thread(message.chat.id)
+    current = thread.get("voice_mode", "assistant")
+
+    if arg in ("transcribe", "on", "off", "только", "расшифровка"):
+        new_mode = "transcribe"
+    elif arg in ("assistant", "claude", "ассистент"):
+        new_mode = "assistant"
+    elif not arg:
+        # Без аргумента — просто переключаем на противоположный режим.
+        new_mode = "transcribe" if current == "assistant" else "assistant"
+    else:
+        await message.answer(
+            "Использование: /voicemode [assistant|transcribe]. Без аргумента — переключает."
+        )
+        return
+
+    thread["voice_mode"] = new_mode
+    save_state(state)
+    if new_mode == "transcribe":
+        await message.answer(
+            f"Голосовые в ветке «{thread_name}»: только расшифровка, Claude не вызывается.\n"
+            "Вернуть обычный режим — /voicemode assistant."
+        )
+    else:
+        await message.answer(
+            f"Голосовые в ветке «{thread_name}»: обычный режим — расшифровка + ответ Claude голосом.\n"
+            "Только расшифровка — /voicemode transcribe."
+        )
+
+
 # ---------- Хендлеры: сообщения ----------
 
 @dp.message(F.text)
@@ -753,7 +862,7 @@ async def on_voice(message: Message):
     wav_path: Path | None = None
     try:
         async with TypingIndicator(message.chat.id):
-            _, thread_name, _ = get_active_thread(message.chat.id)
+            _, thread_name, thread = get_active_thread(message.chat.id)
             cwd = thread_dir(message.chat.id, thread_name)
             ogg_path = cwd / f"voice_{uuid.uuid4().hex}.ogg"
             wav_path = ogg_path.with_suffix(".wav")
@@ -813,10 +922,17 @@ async def on_voice(message: Message):
                 return
 
             await message.answer(f"🎤 Распознано: {text}")
+
+            if thread.get("voice_mode", "assistant") == "transcribe":
+                # /voicemode transcribe — только расшифровка, Claude не
+                # вызывается и ответом голосом заниматься не нужно.
+                return
+
             reply = await run_claude(message.chat.id, text)
-        # Голосовой вход -> голосовой ответ (зеркально). Синтез сам по себе
-        # надёжно откатывается на текст при ошибке внутри send_reply.
-        await send_reply(message, reply, cwd, as_voice=True)
+            # Голосовой вход -> голосовой ответ (зеркально). Синтез сам по
+            # себе надёжно откатывается на текст при ошибке внутри send_reply.
+            # Остаёмся внутри TypingIndicator — синтез может занять время.
+            await send_reply(message, reply, cwd, as_voice=True, speaker=thread.get("tts_speaker"))
     except Exception:
         # Раньше любое необработанное исключение (например, сбой скачивания
         # файла из Telegram) тихо гасилось где-то в диспетчере: пользователь
