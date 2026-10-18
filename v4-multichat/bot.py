@@ -413,8 +413,22 @@ async def run_claude(chat_id: int, prompt: str) -> str:
         return "⏱️ Claude Code не ответил вовремя (таймаут). Попробуйте ещё раз или упростите запрос."
 
     if proc.returncode != 0:
-        log.error("claude stderr: %s", stderr.decode(errors="replace"))
-        return f"⚠️ Claude Code завершился с ошибкой:\n```\n{stderr.decode(errors='replace')[-1500:]}\n```"
+        err_text = stderr.decode(errors="replace").strip()
+        out_text = stdout.decode(errors="replace").strip()
+        # С --output-format json Claude Code пишет причину сбоя (истёкший
+        # токен, лимит подписки и т.п.) в STDOUT, а stderr остаётся пустым —
+        # раньше из-за этого бот показывал пустую ошибку.
+        detail = err_text
+        try:
+            payload = json.loads(out_text)
+            detail = str(payload.get("result") or payload.get("error") or out_text)
+        except (json.JSONDecodeError, AttributeError):
+            detail = err_text or out_text
+        log.error("claude exit=%s stderr=%r stdout=%r", proc.returncode, err_text[-1500:], out_text[-1500:])
+        return (
+            f"⚠️ Claude Code завершился с ошибкой (код {proc.returncode}):\n"
+            f"```\n{(detail or 'нет вывода')[-1500:]}\n```"
+        )
 
     try:
         data = json.loads(stdout.decode())
